@@ -23,6 +23,9 @@ build/
 *.xlsx
 *.csv
 
+# Backtest logs
+*Backtest*.txt
+
 # IDE
 .vscode/
 .idea/
