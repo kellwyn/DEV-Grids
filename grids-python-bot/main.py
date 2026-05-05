@@ -19,14 +19,14 @@ Environment variables (all overridable via .env):
   SYMBOL          MT5 symbol (default: US30)
   TIMEFRAME       Chart timeframe (default: M5)
   BIAS            LONG | SHORT | BOTH | NONE  (default: LONG)
-  GRID_STEP       Points between grid levels (default: 50)
-  EXPECTED_MOVE   Expected daily move in points (default: 350)
-  MAX_TRADES      Max simultaneous trades (default: 5)
+  GRID_STEP       Points between grid levels (default: 500)
+  EXPECTED_MOVE   Expected daily move in points (default: 2500)
+  MAX_TRADES      Max simultaneous trades (default: 4)
   RISK_PERCENT    Risk % per trade (default: 1.0)
   MAX_LOTS        Max lot cap (default: 5.0)
   FIXED_LOTS      Fixed lots (0 = risk-based)
-  TP_PIPS         TP distance in points (default: 50)
-  SL_PIPS         SL distance in points (0 = none)
+  TP_PIPS         TP distance in points (default: 500)
+  SL_PIPS         SL distance in points (default: 1200)
   LOSS_LIMIT_PCT  Max floating loss % of balance (default: 5.0)
   LOSS_LIMIT_USD  Max floating loss $ (0 = disabled)
   EXIT_LEVEL      Physical price exit (0 = disabled)
@@ -120,19 +120,19 @@ cfg = GridConfig(
     timeframe     = _str("TIMEFRAME",    "M5"),
 
     # Grid
-    grid_step     = _int("GRID_STEP",    50),
-    major_step    = _int("MAJOR_STEP",   1000),
-    mid_step      = _int("MID_STEP",     250),
-    tolerance     = _float("TOLERANCE",  15.0),
+    grid_step     = _int("GRID_STEP",    500),
+    major_step    = _int("MAJOR_STEP",   10000),
+    mid_step      = _int("MID_STEP",     2500),
+    tolerance     = _float("TOLERANCE",  150.0),
 
     # Bias
-    bias          = _str("BIAS",         "LONG").upper(),
-    expected_move = _int("EXPECTED_MOVE", 350),
+    bias          = _str("BIAS",         "BOTH").upper(),
+    expected_move = _int("EXPECTED_MOVE", 2500),
 
     # Trade management
-    max_trades    = _int("MAX_TRADES",   5),
-    tp_pips       = _float("TP_PIPS",   50.0),
-    sl_pips       = _float("SL_PIPS",   0.0),
+    max_trades    = _int("MAX_TRADES",   4),
+    tp_pips       = _float("TP_PIPS",   500.0),
+    sl_pips       = _float("SL_PIPS",   1200.0),
     min_rr        = _float("MIN_RR",    0.0),
 
     # Risk

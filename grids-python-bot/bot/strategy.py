@@ -57,19 +57,19 @@ class GridConfig:
     timeframe: str  = "M5"     # chart timeframe for bar detection
 
     # Grid geometry
-    grid_step:  int  = 50      # points between trading levels
-    major_step: int  = 1000    # points between major levels
-    mid_step:   int  = 250     # points between mid levels
-    tolerance:  float = 15.0   # points tolerance for "at a level"
+    grid_step:  int  = 500     # points between trading levels
+    major_step: int  = 10000   # points between major levels
+    mid_step:   int  = 2500    # points between mid levels
+    tolerance:  float = 150.0  # points tolerance for "at a level"
 
     # Direction bias — set via REPL
-    bias:          str  = "LONG"   # LONG | SHORT | BOTH | NONE
-    expected_move: int  = 350      # expected daily range in points (context only)
+    bias:          str  = "BOTH"   # LONG | SHORT | BOTH | NONE
+    expected_move: int  = 2500     # expected daily range in points (context only)
 
     # Trade management
-    max_trades: int   = 5      # max simultaneous grid trades
-    tp_pips:    float = 50.0   # TP distance in points (default = 1 grid step)
-    sl_pips:    float = 0.0    # SL distance in points (0 = no hard SL)
+    max_trades: int   = 4      # max simultaneous grid trades
+    tp_pips:    float = 500.0  # TP distance in points (default = 1 grid step)
+    sl_pips:    float = 1200.0 # SL distance in points (0 = no hard SL)
     min_rr:     float = 0.0    # minimum R:R ratio (0 = disabled)
 
     # Risk
@@ -109,7 +109,7 @@ def get_level_type(level: float, cfg: GridConfig) -> str:
     return "MINOR"
 
 
-def get_grid_levels(center: float, cfg: GridConfig, n_above: int = 15, n_below: int = 15) -> List[float]:
+def get_grid_levels(center: float, cfg: GridConfig, n_above: int = 12, n_below: int = 12) -> List[float]:
     """Return sorted list of grid levels around center price."""
     base = round(center / cfg.grid_step) * cfg.grid_step
     return [base + i * cfg.grid_step for i in range(-n_below, n_above + 1)]
@@ -341,11 +341,18 @@ def find_setups(cfg: GridConfig, entered_levels: set) -> List[GridSetup]:
         tp_dist = cfg.tp_pips * point
         sl_dist = cfg.sl_pips * point if cfg.sl_pips > 0 else 0.0
 
+        # Prefer level-anchored TP (clean grid exit). Fall back to entry-anchored
+        # when the level-based target would land on the wrong side of entry
+        # (price moved away from the level between bar close and execution).
         if direction == "LONG":
             target    = level + tp_dist
+            if target <= entry:          # TP below entry — anchor to entry instead
+                target = entry + tp_dist
             stop_loss = (entry - sl_dist) if sl_dist > 0 else 0.0
         else:
             target    = level - tp_dist
+            if target >= entry:          # TP above entry — anchor to entry instead
+                target = entry - tp_dist
             stop_loss = (entry + sl_dist) if sl_dist > 0 else 0.0
 
         # R:R check

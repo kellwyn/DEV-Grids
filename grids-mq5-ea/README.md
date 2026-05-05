@@ -1,6 +1,6 @@
 # GridReid — MQL5 Expert Advisor
 
-US30 psychological level grid strategy. Two EA versions share the same core logic; v1.1 adds cross-trade management on top of v1.00.
+US30 psychological level grid strategy. Versions share the same core logic with each build layering additional management on top.
 
 ---
 
@@ -10,6 +10,7 @@ US30 psychological level grid strategy. Two EA versions share the same core logi
 |------|-------------|
 | `GridReid_v1.00.mq5` | Initial release — core grid strategy |
 | `GridReid_v1.1.mq5`  | Cross-trade management build |
+| `GridReid_v1.2.mq5`  | v1.3 code (4 targeted improvements — see v1.3 section) |
 
 ---
 
@@ -245,6 +246,50 @@ Day status values: `ACTIVE`, `DONE — no new entries`, `NEWS BLACKOUT`.
 
 ---
 
+## v1.3 — Four Targeted Improvements (in GridReid_v1.2.mq5)
+
+All v1.1 rules apply, plus the following changes.
+
+### Fix 1 — T1 Detection Under BOTH Bias
+
+`CheckFirstTradeStatus()` previously used a time-windowed `HistorySelect(openTime, now)` to find the T1 closing deal. Under BOTH bias, concurrent opposite-direction trades in the same window caused mismatches, allowing unlimited pyramid adding on loss-limit days.
+
+**Fix:** `HistorySelectByPosition(g_firstTradePosID)` selects only deals belonging to the exact T1 position ID, independent of time windows or concurrent trades. `POSITION_IDENTIFIER` is now recorded at T1 entry.
+
+### Fix 2 — Momentum Gate Applied to T1
+
+The v1.1 momentum check had `g_tradesOpenedToday >= 1 &&` — meaning T1 was never filtered. Analysis of 9 loss-limit events found 7/9 were T1 entries with no momentum filter applied. The exemption has been removed; `IsMomentumOpposite()` now runs for all trades including T1.
+
+### Fix 3 — BIAS_AUTO
+
+A new `BIAS_AUTO = 4` enum value. When selected, the EA computes the operative bias each bar using `iBands(SMA=200, StdDev=InpStdDevMult)`:
+
+| Price position | Effective bias |
+|---|---|
+| Above upper band (SMA + N×σ) | SHORT |
+| Below lower band (SMA − N×σ) | LONG |
+| Between bands | NONE |
+
+New inputs: `InpSMAperiod` (default 200), `InpStdDevMult` (default 1.0 = ±1 standard deviation).
+
+Dashboard shows `AUTO→LONG`, `AUTO→SHORT`, or `AUTO→NONE`.
+
+### Fix 4 — Trade Session Expiry
+
+Each trade is automatically closed at the end of the ICT session it was opened in, or after `InpMaxDurationHours` (default 4h) — whichever comes first.
+
+| Session open time | Session end (UTC) |
+|---|---|
+| Asian  22:00–09:00 | 09:00 |
+| London 07:00–16:00 | 16:00 |
+| London+NY overlap 12:00–16:00 | 16:00 |
+| NY-only 16:00–21:00 | 21:00 |
+| Off-session 21:00–22:00 | Hard cap only |
+
+Set `InpMaxDurationHours = 0` to disable the hard cap and use session end only.
+
+---
+
 ## Verification Before Running Live
 
 | Change | How to verify |
@@ -262,6 +307,6 @@ Day status values: `ACTIVE`, `DONE — no new entries`, `NEWS BLACKOUT`.
 - US30: 1 point ≠ 1 pip. Confirm `tick_size` and `tick_value` via `mt5.symbol_info("US30")`.
 - APP/SAPP checks run every tick. Individual broker TPs also run independently — whichever fires first closes the trade.
 - SAPP is reached before APP (for LONG). Enabling both means SAPP always fires first. Use one or the other.
-- Momentum skip only applies to the 2nd+ trade. The first trade is never skipped.
+- Momentum skip applies to ALL trades including T1 (v1.3+). Earlier versions exempted T1.
 - Day rules reset at the calendar day boundary (UTC bar time), not at session open.
 - `MANUAL_CONFIRM=true` in the Python bot must be set until the strategy is validated on demo. The EA has no equivalent flag — validate via backtesting before attaching to a live chart.

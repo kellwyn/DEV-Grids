@@ -8,11 +8,13 @@
 //|      Mid levels   : every 250 points  — intermediate support/res |
 //|      Minor levels : every 50 points   — active trading levels   |
 //|                                                                  |
-//|   2. Daily bias: LONG, SHORT, or BOTH                           |
+//|   2. Daily bias: LONG, SHORT, BOTH, NONE, AUTO                  |
 //|      LONG  — buy when price comes DOWN to a level               |
 //|      SHORT — sell when price goes UP to a level                 |
 //|      BOTH  — buy at lower touches, sell at upper touches        |
 //|      NONE  — monitor grid only, no entries                      |
+//|      AUTO  — SMA200±N-StdDev band: LONG below, SHORT above,    |
+//|              NONE between (re-evaluated each bar)               |
 //|                                                                  |
 //|   3. TP = next grid level in bias direction (InpTPPoints)       |
 //|      SL = optional hard stop in points (0 = use loss limit only)|
@@ -29,6 +31,10 @@
 //|      Slot 0 = 00:00 UTC, Slot 28 = 14:00 UTC, Slot 47 = 23:30  |
 //|      ICT sessions: Asian 22:00-09:00 / London 07:00-16:00 /    |
 //|                    NY 12:00-21:00 (all UTC)                     |
+//|                                                                  |
+//|   7. Trade expiry: each trade closes at end of the ICT session  |
+//|      it was opened in, or after InpMaxDurationHours (hard cap). |
+//|      Whichever comes first.                                      |
 //|                                                                  |
 //|─────────────────── VERSION HISTORY ─────────────────────────────|
 //|  v1.00  2026-04-26  — Initial release                           |
@@ -52,11 +58,23 @@
 //|    · Entry arrows: white buy/sell arrows at each trade entry    |
 //|                                                                  |
 //|  v1.2   2026-04-30  — Clone baseline for development            |
+//|                                                                  |
+//|  v1.3   2026-05-01  — Four targeted improvements                |
+//|    · Fix T1 detection under BOTH bias: use                      |
+//|      HistorySelectByPosition(posID) — position-ID-based,        |
+//|      replaces fragile time-windowed HistorySelect()             |
+//|    · Momentum gate applied to T1 (same as T2/T3)               |
+//|    · BIAS_AUTO: SMA200 ± N StdDev bands; LONG below lower      |
+//|      band, SHORT above upper band, NONE between — re-evaluated  |
+//|      each bar via iBands()                                       |
+//|    · Trade session expiry: close at end of opening ICT session  |
+//|      (Asian→09:00, London→16:00, NY→21:00 UTC) or              |
+//|      InpMaxDurationHours hard cap, whichever is earlier         |
 //+------------------------------------------------------------------+
 
 #property copyright "Grid Reid Strategy"
-#property version   "1.20"
-#property description "GridReid — US30 Psychological Level Grid Strategy v1.2"
+#property version   "1.30"
+#property description "GridReid — US30 Psychological Level Grid Strategy v1.3"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -69,6 +87,7 @@ enum ENUM_GRID_BIAS
     BIAS_SHORT = 1,  // Short only (sell rallies to levels)
     BIAS_BOTH  = 2,  // Both directions (classic grid)
     BIAS_NONE  = 3,  // Monitor only — no entries
+    BIAS_AUTO  = 4,  // Any one direction — SMA200±σ picks LONG/SHORT/NONE at day start; locked for the day
 };
 
 //── Trade info struct (for APP/SAPP sort by open time) ────────────
@@ -82,28 +101,47 @@ struct STradeInfo
     bool     isLong;
 };
 
+//── Trade expiry struct (session close + hard cap) ─────────────────
+
+struct STradeExpiry
+{
+    ulong    ticket;
+    datetime expiry;
+};
+
 //── Inputs ────────────────────────────────────────────────────────
 
 input group "=== Grid Configuration ==="
-input int    InpGridStep         = 50;         // Grid step in points
-input int    InpMajorStep        = 1000;       // Major level spacing (solid lines)
-input int    InpMidStep          = 250;        // Mid level spacing (dashed lines)
+input int    InpGridStep         = 500;        // Grid step in points
+input int    InpMajorStep        = 10000;      // Major level spacing (solid lines)
+input int    InpMidStep          = 2500;       // Mid level spacing (dashed lines)
 input int    InpLevelsAbove      = 12;         // Grid levels shown above price
 input int    InpLevelsBelow      = 12;         // Grid levels shown below price
-input double InpLevelTolerance   = 15.0;       // Touch tolerance in points
+input double InpLevelTolerance   = 150.0;      // Touch tolerance in points
 
 input group "=== Direction Bias ==="
-input ENUM_GRID_BIAS InpBias     = BIAS_LONG;  // Daily trading bias
-input int    InpExpectedMove     = 350;        // Expected daily range (points)
-input int    InpMaxTrades        = 5;          // Max simultaneous grid trades
+input ENUM_GRID_BIAS InpBias     = BIAS_BOTH;  // Daily trading bias
+input int    InpExpectedMove     = 2500;       // Expected daily range (points)
+input int    InpMaxTrades        = 4;          // Max simultaneous grid trades
+
+input group "=== BIAS_AUTO Settings ==="
+input int    InpSMAperiod        = 200;        // SMA period for BIAS_AUTO bands
+input double InpStdDevMult       = 1.0;        // StdDev multiplier (1.0 = ±1σ from SMA200)
+
+input group "=== BOTH Bias — Per-Direction Group Exits ==="
+input int    InpGroupTPPts       = 50;         // Close direction subgroup when price is +N pts from its T1 entry
+input int    InpGroupSLPts       = 10;         // Close direction subgroup when price is -N pts from its T1 entry
 
 input group "=== Exit Settings ==="
-input int    InpTPPoints         = 50;         // TP distance in points (one grid step)
-input int    InpSLPoints         = 0;          // SL distance in points (0 = loss limit only)
+input int    InpTPPoints         = 500;        // TP distance in points (one grid step)
+input int    InpSLPoints         = 1200;       // SL distance in points (0 = loss limit only)
 input double InpMinRR            = 0.0;        // Minimum R:R ratio (0 = disabled)
 input double InpLossLimitPct     = 5.0;        // Max floating loss as % of balance
 input double InpLossLimitUSD     = 0.0;        // Max floating loss in $ (0 = disabled)
 input double InpExitLevel        = 0.0;        // Physical exit price (0 = disabled)
+
+input group "=== Trade Duration ==="
+input int    InpMaxDurationHours = 4;          // Hard cap per trade in hours (0 = disabled)
 
 input group "=== Risk Management ==="
 input double InpRiskPct          = 1.0;        // Risk % per trade
@@ -135,7 +173,7 @@ input bool   InpUseSAPP          = false;      // SAPP exit: T1 full loss + T2+ 
 input bool   InpUseT1BE          = true;       // T1-BE exit: close all when price = T1 entry (net profit)
 
 input group "=== Momentum Filter ==="
-input bool   InpUseMomentum      = true;       // Skip level if strong opposing momentum
+input bool   InpUseMomentum      = true;       // Skip level if strong opposing momentum (all trades incl. T1)
 input int    InpMomentumBars     = 3;          // Bars to measure directional momentum
 input double InpMomentumFactor   = 1.5;        // ATR(14) multiple to qualify high momentum
 
@@ -153,6 +191,7 @@ input int    InpMinorWidth       = 1;          // Minor line width
 CTrade   g_trade;
 datetime g_lastBar     = 0;
 int      g_atrHandle   = INVALID_HANDLE;
+int      g_bandsHandle = INVALID_HANDLE;       // iBands for BIAS_AUTO
 
 // Parsed period filter
 int      g_periods[];
@@ -170,9 +209,18 @@ int      g_tradesOpenedToday = 0;      // count of trades opened today
 
 // First-trade tracking
 ulong    g_firstTradeTicket  = 0;      // position ticket of today's first trade
+ulong    g_firstTradePosID   = 0;      // POSITION_IDENTIFIER for history matching
 double   g_firstTradeEntry   = 0.0;    // open price of first trade
-datetime g_firstTradeTime    = 0;      // open time (for history lookup)
+datetime g_firstTradeTime    = 0;      // open time (informational)
 bool     g_firstTradeOpen    = false;  // is first trade still open?
+
+// BIAS_AUTO computed state
+ENUM_GRID_BIAS g_autoBias    = BIAS_NONE; // resolved bias when InpBias==BIAS_AUTO
+bool           g_autoBiasSet = false;     // true once set for today — locked until day reset
+
+// Trade expiry list
+STradeExpiry g_expiryList[];
+int          g_expiryCnt = 0;
 
 //+------------------------------------------------------------------+
 //| Init                                                             |
@@ -187,15 +235,23 @@ int OnInit()
     g_atrHandle  = iATR(_Symbol, PERIOD_CURRENT, 14);
 
     if(g_atrHandle == INVALID_HANDLE)
-        Print("GridReid v1.2: ATR handle failed — momentum filter disabled.");
+        Print("GridReid v1.3: ATR handle failed — momentum filter disabled.");
+
+    if(InpBias == BIAS_AUTO)
+    {
+        g_bandsHandle = iBands(_Symbol, PERIOD_CURRENT, InpSMAperiod, 0, InpStdDevMult, PRICE_CLOSE);
+        if(g_bandsHandle == INVALID_HANDLE)
+            Print("GridReid v1.3: Bands handle failed — BIAS_AUTO will default to NONE.");
+    }
 
     if(InpShowGrid)
         DrawGrid(SymbolInfoDouble(_Symbol, SYMBOL_BID));
 
     ResetDayState();
 
-    Print("GridReid v1.2 | Bias=", EnumToString(InpBias),
-          " | Step=", InpGridStep, "pts | MaxTrades=", InpMaxTrades);
+    Print("GridReid v1.3 | Bias=", EnumToString(InpBias),
+          " | Step=", InpGridStep, "pts | MaxTrades=", InpMaxTrades,
+          " | MaxDuration=", InpMaxDurationHours, "h");
     return INIT_SUCCEEDED;
 }
 
@@ -206,8 +262,8 @@ void OnDeinit(const int reason)
 {
     DeleteGridObjects();
     DeleteTradeArrows();
-    if(g_atrHandle != INVALID_HANDLE)
-        IndicatorRelease(g_atrHandle);
+    if(g_atrHandle   != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+    if(g_bandsHandle != INVALID_HANDLE) IndicatorRelease(g_bandsHandle);
     Comment("");
 }
 
@@ -232,12 +288,18 @@ void OnTick()
     // Enforce hard loss limits every tick
     CheckLossLimits(bid);
 
+    // Close any trades that have reached their session/duration expiry
+    CheckTradeExpiry();
+
     // Track first trade closure and update day state
     CheckFirstTradeStatus();
     CheckDayRules();
 
-    // Group break-even exits (APP / SAPP / T1-BE)
+    // Group break-even exits (APP / SAPP / T1-BE) — same-direction portfolios
     CheckBreakEvenExits(bid);
+
+    // Per-direction exits for BOTH bias mixed portfolios
+    CheckBothBiasGroupExits(bid);
 
     // Gate on new bar
     datetime barTime = iTime(_Symbol, PERIOD_CURRENT, 0);
@@ -257,6 +319,9 @@ void OnTick()
         g_lastDay = dt.day;
     }
 
+    // Recompute BIAS_AUTO each bar from current band position
+    UpdateAutoBias();
+
     // Time and day-done filters
     if(g_dayTradingDone || !IsAllowedTime())
     {
@@ -269,11 +334,54 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
+//| Return the operative bias (resolves BIAS_AUTO → computed value)  |
+//+------------------------------------------------------------------+
+ENUM_GRID_BIAS GetEffectiveBias()
+{
+    if(InpBias == BIAS_AUTO) return g_autoBias;
+    return InpBias;
+}
+
+//+------------------------------------------------------------------+
+//| Set g_autoBias once per day from SMA200±σ band position          |
+//| Called at day start only — direction is locked for the day so    |
+//| all concurrent trades follow the same single direction.          |
+//+------------------------------------------------------------------+
+void UpdateAutoBias()
+{
+    if(InpBias != BIAS_AUTO) return;
+    if(g_autoBiasSet) return;  // already determined for today — do not flip mid-day
+
+    if(g_bandsHandle == INVALID_HANDLE) { g_autoBias = BIAS_NONE; g_autoBiasSet = true; return; }
+
+    double upper[], lower[];
+    ArraySetAsSeries(upper, true);
+    ArraySetAsSeries(lower, true);
+
+    // iBands buffers: 0=BASE_LINE, 1=UPPER_BAND, 2=LOWER_BAND
+    if(CopyBuffer(g_bandsHandle, 1, 1, 1, upper) < 1) return;
+    if(CopyBuffer(g_bandsHandle, 2, 1, 1, lower) < 1) return;
+
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    if(bid > upper[0])
+        g_autoBias = BIAS_SHORT;   // price above SMA200+σ → SHORT for the day
+    else if(bid < lower[0])
+        g_autoBias = BIAS_LONG;    // price below SMA200−σ → LONG for the day
+    else
+        g_autoBias = BIAS_NONE;    // price inside band → no trades today
+
+    g_autoBiasSet = true;
+    Print("GridReid v1.3: BIAS_AUTO day direction = ", EnumToString(g_autoBias),
+          "  (upper=", upper[0], " lower=", lower[0], " bid=", bid, ")");
+}
+
+//+------------------------------------------------------------------+
 //| Main strategy — scan for level touches on completed bar          |
 //+------------------------------------------------------------------+
 void RunStrategy()
 {
-    if(InpBias == BIAS_NONE) return;
+    if(GetEffectiveBias() == BIAS_NONE) return;
 
     int openCnt = CountOpenTrades();
     if(openCnt >= InpMaxTrades) return;
@@ -310,6 +418,8 @@ void RunStrategy()
         levelCount++;
     }
 
+    ENUM_GRID_BIAS effBias = GetEffectiveBias();
+
     for(int i = 0; i < levelCount; i++)
     {
         double lvl = touchedLevels[i];
@@ -317,8 +427,8 @@ void RunStrategy()
         if(HasEnteredLevel(lvl))   continue;
         if(LevelHasOpenTrade(lvl)) continue;
 
-        bool canLong  = (InpBias == BIAS_LONG  || InpBias == BIAS_BOTH);
-        bool canShort = (InpBias == BIAS_SHORT || InpBias == BIAS_BOTH);
+        bool canLong  = (effBias == BIAS_LONG  || effBias == BIAS_BOTH);
+        bool canShort = (effBias == BIAS_SHORT || effBias == BIAS_BOTH);
 
         bool   entered   = false;
         ulong  newTicket = 0;
@@ -326,12 +436,11 @@ void RunStrategy()
         // LONG: price came DOWN to this level
         if(canLong && touchedFromAbove[i])
         {
-            // News blackout blocks all entries
             if(IsNewsBlackout()) continue;
 
-            // For 2nd+ trade, skip level if bearish momentum is strong
-            if(g_tradesOpenedToday >= 1 && IsMomentumOpposite(true))
-                continue;  // skip — loop continues to next (lower) level
+            // Momentum gate applies to ALL trades including T1
+            if(IsMomentumOpposite(true))
+                continue;
 
             if(OpenLong(lvl, ask, newTicket))
                 entered = true;
@@ -342,7 +451,8 @@ void RunStrategy()
         {
             if(IsNewsBlackout()) continue;
 
-            if(g_tradesOpenedToday >= 1 && IsMomentumOpposite(false))
+            // Momentum gate applies to ALL trades including T1
+            if(IsMomentumOpposite(false))
                 continue;
 
             if(OpenShort(lvl, bid, newTicket))
@@ -353,16 +463,21 @@ void RunStrategy()
         {
             if(g_tradesOpenedToday == 0)
             {
-                // First trade of the day — record for tracking
+                // First trade of the day — record ticket and position ID for T1 tracking
                 g_firstTradeTicket = newTicket;
                 g_firstTradeTime   = TimeCurrent();
                 g_firstTradeOpen   = true;
 
-                // Get actual open price from position (may differ from lvl by spread/slip)
                 if(PositionSelectByTicket(newTicket))
+                {
                     g_firstTradeEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+                    g_firstTradePosID = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+                }
                 else
+                {
                     g_firstTradeEntry = lvl;
+                    g_firstTradePosID = newTicket;  // fallback
+                }
             }
             else
             {
@@ -370,6 +485,7 @@ void RunStrategy()
                 g_dayHadDrawdown = true;
             }
 
+            RegisterExpiry(newTicket, TimeCurrent());
             DrawEntryArrow(lvl, canLong && touchedFromAbove[i], newTicket);
             MarkLevelEntered(lvl);
             g_tradesOpenedToday++;
@@ -444,7 +560,8 @@ double CalcLots(double entry, double sl)
 
     if(sl <= 0.0)
     {
-        sl = (InpBias == BIAS_SHORT)
+        ENUM_GRID_BIAS effBias = GetEffectiveBias();
+        sl = (effBias == BIAS_SHORT)
              ? entry + InpGridStep * _Point
              : entry - InpGridStep * _Point;
     }
@@ -503,8 +620,9 @@ void CheckLossLimits(double bid)
 
     if(!close && InpExitLevel > 0.0)
     {
-        if(InpBias == BIAS_LONG  && bid < InpExitLevel) { Print("EXIT LEVEL breached (LONG)");  close = true; }
-        if(InpBias == BIAS_SHORT && bid > InpExitLevel) { Print("EXIT LEVEL breached (SHORT)"); close = true; }
+        ENUM_GRID_BIAS effBias = GetEffectiveBias();
+        if(effBias == BIAS_LONG  && bid < InpExitLevel) { Print("EXIT LEVEL breached (LONG)");  close = true; }
+        if(effBias == BIAS_SHORT && bid > InpExitLevel) { Print("EXIT LEVEL breached (SHORT)"); close = true; }
     }
 
     if(close)
@@ -516,6 +634,7 @@ void CheckLossLimits(double bid)
 
 //+------------------------------------------------------------------+
 //| Detect when first trade closes; apply day rule 1 (TP → done)    |
+//| Uses HistorySelectByPosition for reliable BOTH-bias detection    |
 //+------------------------------------------------------------------+
 void CheckFirstTradeStatus()
 {
@@ -525,12 +644,14 @@ void CheckFirstTradeStatus()
 
     g_firstTradeOpen = false;
 
-    // Search deal history for the closing deal of this position
-    HistorySelect(g_firstTradeTime, TimeCurrent() + 1);
+    // Position-ID-based history query — works correctly under BOTH bias
+    // because it selects only deals belonging to this exact position,
+    // regardless of concurrent opposite-direction trades in the same time window.
+    HistorySelectByPosition(g_firstTradePosID);
     for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
     {
         ulong deal = HistoryDealGetTicket(i);
-        if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != g_firstTradeTicket) continue;
+        if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != g_firstTradePosID) continue;
         if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
 
         double profit = HistoryDealGetDouble(deal, DEAL_PROFIT);
@@ -538,7 +659,7 @@ void CheckFirstTradeStatus()
         {
             // Day rule 1: first trade hit TP — stop new entries
             g_dayTradingDone = true;
-            Print("GridReid v1.2: T1 TP hit (profit=", profit, ") — no more entries today.");
+            Print("GridReid v1.3: T1 TP hit (profit=", profit, ") — no more entries today.");
         }
         else
         {
@@ -560,7 +681,7 @@ void CheckDayRules()
     if(g_tradesOpenedToday >= 2 && CountOpenTrades() == 0)
     {
         g_dayTradingDone = true;
-        Print("GridReid v1.2: Drawdown cycle resolved — no more entries today.");
+        Print("GridReid v1.3: Drawdown cycle resolved — no more entries today.");
     }
 }
 
@@ -655,7 +776,7 @@ void CheckBreakEvenExits(double bid)
         bool hit = allLong ? (bid >= t1Entry) : (bid <= t1Entry);
         if(hit)
         {
-            Print("GridReid v1.2: T1-BE exit — price=", bid,
+            Print("GridReid v1.3: T1-BE exit — price=", bid,
                   " T1entry=", t1Entry, " closing all for net profit.");
             CloseAllTrades();
             g_dayTradingDone = true;
@@ -669,7 +790,7 @@ void CheckBreakEvenExits(double bid)
         bool hit = allLong ? (bid >= app) : (bid <= app);
         if(hit)
         {
-            Print("GridReid v1.2: APP exit — price=", bid,
+            Print("GridReid v1.3: APP exit — price=", bid,
                   " APP=", app, " closing all at net zero.");
             CloseAllTrades();
             g_dayTradingDone = true;
@@ -683,12 +804,99 @@ void CheckBreakEvenExits(double bid)
         bool hit = allLong ? (bid >= sapp) : (bid <= sapp);
         if(hit)
         {
-            Print("GridReid v1.2: SAPP exit — price=", bid,
+            Print("GridReid v1.3: SAPP exit — price=", bid,
                   " SAPP=", sapp, " T1 takes loss, T2+ at zero.");
             CloseAllTrades();
             g_dayTradingDone = true;
             return;
         }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Per-direction group exits for BOTH bias with mixed portfolios    |
+//|                                                                  |
+//| CollectTrades() returns false when LONGs and SHORTs are both     |
+//| open, blocking APP/SAPP/T1-BE. This function handles that case  |
+//| by splitting positions into two direction subgroups and applying |
+//| independent TP/SL exits to each:                                |
+//|   TP: price reaches T1_entry ± InpGroupTPPts (same as T1's own  |
+//|       individual TP — closes all trades in that direction)       |
+//|   SL: price moves InpGroupSLPts against T1 entry — tight cut    |
+//|                                                                  |
+//| Does NOT set g_dayTradingDone — the remaining direction group    |
+//| continues trading until its own exit or day rules fire.         |
+//+------------------------------------------------------------------+
+void CheckBothBiasGroupExits(double bid)
+{
+    if(InpBias != BIAS_BOTH) return;
+
+    // Collect LONG and SHORT subgroups separately
+    ulong  longTickets[], shortTickets[];
+    double longT1Entry  = 0, shortT1Entry = 0;
+    datetime longT1Time = 0, shortT1Time  = 0;
+    int    longCnt = 0, shortCnt = 0;
+    bool   hasLong = false, hasShort = false;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong t = PositionGetTicket(i);
+        if(!PositionSelectByTicket(t)) continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+        bool     isLong   = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+        double   entry    = PositionGetDouble(POSITION_PRICE_OPEN);
+        datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+
+        if(isLong)
+        {
+            ArrayResize(longTickets, longCnt + 1);
+            longTickets[longCnt++] = t;
+            if(!hasLong || openTime < longT1Time) { longT1Entry = entry; longT1Time = openTime; }
+            hasLong = true;
+        }
+        else
+        {
+            ArrayResize(shortTickets, shortCnt + 1);
+            shortTickets[shortCnt++] = t;
+            if(!hasShort || openTime < shortT1Time) { shortT1Entry = entry; shortT1Time = openTime; }
+            hasShort = true;
+        }
+    }
+
+    // Only fires when both directions are open (mixed portfolio)
+    if(!hasLong || !hasShort) return;
+
+    double tpDist = InpGroupTPPts * _Point;
+    double slDist = InpGroupSLPts * _Point;
+
+    // LONG subgroup exits
+    bool closeLongs = false;
+    string longReason = "";
+    if(bid >= longT1Entry + tpDist) { closeLongs = true; longReason = "TP"; }
+    else if(bid <= longT1Entry - slDist) { closeLongs = true; longReason = "SL"; }
+
+    if(closeLongs)
+    {
+        Print("GridReid v1.3: BOTH-bias LONG group ", longReason, " — closing ", longCnt,
+              " LONG trades (T1=", longT1Entry, " bid=", bid, ")");
+        for(int i = longCnt - 1; i >= 0; i--)
+            g_trade.PositionClose(longTickets[i]);
+    }
+
+    // SHORT subgroup exits (re-evaluate bid — LONGs may have just closed)
+    bool closeShorts = false;
+    string shortReason = "";
+    if(bid <= shortT1Entry - tpDist) { closeShorts = true; shortReason = "TP"; }
+    else if(bid >= shortT1Entry + slDist) { closeShorts = true; shortReason = "SL"; }
+
+    if(closeShorts)
+    {
+        Print("GridReid v1.3: BOTH-bias SHORT group ", shortReason, " — closing ", shortCnt,
+              " SHORT trades (T1=", shortT1Entry, " bid=", bid, ")");
+        for(int i = shortCnt - 1; i >= 0; i--)
+            g_trade.PositionClose(shortTickets[i]);
     }
 }
 
@@ -733,6 +941,108 @@ bool IsNewsBlackout()
     int endMin   = InpNewsBlockEndH   * 60 + InpNewsBlockEndM;
 
     return (nowMin >= startMin && nowMin < endMin);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate expiry time for a trade opened at openTime             |
+//|   Rule: min(sessionEnd, openTime + InpMaxDurationHours)          |
+//|   Session ends: Asian→09:00, London→16:00, NY→21:00 UTC         |
+//|   Asian wraps midnight: trades opened 22:00-23:59 expire         |
+//|   at next-day 09:00; trades opened 00:00-08:59 expire same day. |
+//+------------------------------------------------------------------+
+datetime CalcExpiry(datetime openTime)
+{
+    MqlDateTime dt;
+    TimeToStruct(openTime, dt);
+    int h = dt.hour;
+
+    // Day start (00:00:00 of the open-time calendar day, UTC)
+    datetime dayStart = openTime - (dt.hour * 3600 + dt.min * 60 + dt.sec);
+
+    datetime cap4h = (InpMaxDurationHours > 0)
+                     ? openTime + (datetime)(InpMaxDurationHours * 3600)
+                     : 0;  // 0 = no cap
+
+    datetime sessionEnd;
+
+    // Asian session 22:00-09:00 UTC (wraps midnight)
+    if(IsInWindow(h, 22, 9))
+    {
+        if(h >= 22)
+            sessionEnd = dayStart + 24*3600 + 9*3600;   // next-day 09:00
+        else
+            sessionEnd = dayStart + 9*3600;              // same-day 09:00
+    }
+    // London 07:00-16:00 (includes 12:00-16:00 London+NY overlap)
+    else if(IsInWindow(h, 7, 16))
+    {
+        sessionEnd = dayStart + 16*3600;
+    }
+    // NY-only 16:00-21:00
+    else if(IsInWindow(h, 12, 21))
+    {
+        sessionEnd = dayStart + 21*3600;
+    }
+    // Off-session 21:00-22:00: no session boundary, use hard cap only
+    else
+    {
+        return (cap4h > 0) ? cap4h : openTime + 4*3600;  // safe default
+    }
+
+    if(cap4h > 0)
+        return MathMin(cap4h, sessionEnd);
+    return sessionEnd;
+}
+
+//+------------------------------------------------------------------+
+//| Register expiry for a newly opened trade                         |
+//+------------------------------------------------------------------+
+void RegisterExpiry(ulong ticket, datetime openTime)
+{
+    if(InpMaxDurationHours <= 0) return;  // feature disabled
+
+    datetime expiry = CalcExpiry(openTime);
+    ArrayResize(g_expiryList, g_expiryCnt + 1);
+    g_expiryList[g_expiryCnt].ticket = ticket;
+    g_expiryList[g_expiryCnt].expiry = expiry;
+    g_expiryCnt++;
+
+    Print("GridReid v1.3: Trade ", ticket, " expiry = ",
+          TimeToString(expiry, TIME_DATE|TIME_MINUTES), " UTC");
+}
+
+//+------------------------------------------------------------------+
+//| Close trades that have passed their expiry                       |
+//+------------------------------------------------------------------+
+void CheckTradeExpiry()
+{
+    if(InpMaxDurationHours <= 0 || g_expiryCnt == 0) return;
+
+    datetime now = TimeCurrent();
+    for(int i = g_expiryCnt - 1; i >= 0; i--)
+    {
+        if(now < g_expiryList[i].expiry) continue;
+
+        ulong ticket = g_expiryList[i].ticket;
+        if(PositionSelectByTicket(ticket) &&
+           PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+        {
+            Print("GridReid v1.3: Closing ticket ", ticket, " — session/duration expiry.");
+            g_trade.PositionClose(ticket);
+        }
+        RemoveExpirySlot(i);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Remove one slot from the expiry list (shift down)                |
+//+------------------------------------------------------------------+
+void RemoveExpirySlot(int idx)
+{
+    for(int i = idx; i < g_expiryCnt - 1; i++)
+        g_expiryList[i] = g_expiryList[i + 1];
+    g_expiryCnt--;
+    ArrayResize(g_expiryList, g_expiryCnt);
 }
 
 //+------------------------------------------------------------------+
@@ -789,6 +1099,10 @@ double TotalFloatingPL()
 //+------------------------------------------------------------------+
 void CloseAllTrades()
 {
+    // Clear expiry list — all positions being closed
+    ArrayResize(g_expiryList, 0);
+    g_expiryCnt = 0;
+
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong ticket = PositionGetTicket(i);
@@ -874,9 +1188,14 @@ void ResetDayState()
     g_dayHadDrawdown    = false;
     g_tradesOpenedToday = 0;
     g_firstTradeTicket  = 0;
+    g_firstTradePosID   = 0;
     g_firstTradeEntry   = 0.0;
     g_firstTradeTime    = 0;
     g_firstTradeOpen    = false;
+    ArrayResize(g_expiryList, 0);
+    g_expiryCnt         = 0;
+    g_autoBias          = BIAS_NONE;
+    g_autoBiasSet       = false;
 }
 
 //+------------------------------------------------------------------+
@@ -1005,9 +1324,22 @@ void ShowDashboard()
     int slot = t.hour * 2 + (t.min / 30);
 
     string session = GetSessionName(t.hour);
-    string biasStr = (InpBias == BIAS_LONG) ? "LONG" :
-                     (InpBias == BIAS_SHORT) ? "SHORT" :
-                     (InpBias == BIAS_BOTH)  ? "BOTH" : "NONE";
+
+    // Bias display: show effective value; for AUTO also show computed direction
+    string biasStr;
+    ENUM_GRID_BIAS effBias = GetEffectiveBias();
+    if(InpBias == BIAS_AUTO)
+    {
+        string effStr = (effBias == BIAS_LONG)  ? "LONG"  :
+                        (effBias == BIAS_SHORT) ? "SHORT" : "NONE";
+        biasStr = StringFormat("AUTO→%s", effStr);
+    }
+    else
+    {
+        biasStr = (InpBias == BIAS_LONG)  ? "LONG"  :
+                  (InpBias == BIAS_SHORT) ? "SHORT" :
+                  (InpBias == BIAS_BOTH)  ? "BOTH"  : "NONE";
+    }
 
     double nearestAbove = MathCeil (bid / InpGridStep) * InpGridStep;
     double nearestBelow = MathFloor(bid / InpGridStep) * InpGridStep;
@@ -1047,7 +1379,7 @@ void ShowDashboard()
 
     Comment(
         "═══════════════════════════════════\n",
-        "  GRID REID  v1.2    |  ", _Symbol, "\n",
+        "  GRID REID  v1.3    |  ", _Symbol, "\n",
         "═══════════════════════════════════\n",
         StringFormat("  Price    : %.0f\n", bid),
         StringFormat("  Bias     : %s  |  Move: %d pts\n", biasStr, InpExpectedMove),
