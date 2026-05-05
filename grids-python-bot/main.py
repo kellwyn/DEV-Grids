@@ -39,7 +39,7 @@ import os
 import sys
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -181,7 +181,7 @@ def _monitor_loop():
     while not _stop_event.is_set():
         try:
             # Reset entered levels at day boundary
-            today = datetime.utcnow().day
+            today = datetime.now(timezone.utc).day
             if today != _last_day:
                 _entered_levels = set()
                 _last_day = today
